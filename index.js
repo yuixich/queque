@@ -9,9 +9,10 @@ class Queque {
         this.handler = () => {};
 
         this.timer = null;
+        this.redis = Redis.createInstance();
     }
 
-    push() {
+    push(jobKey, runAt, jsonable) {
     }
 
     start() {
@@ -21,9 +22,15 @@ class Queque {
     }
 
     stop() {
+        clearInterval(this.timer);
+        this.timer = null;
     }
 
     poll() {
+        this.redis.zrange...
+    }
+
+    handle() {
     }
 }
 
