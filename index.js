@@ -4,13 +4,30 @@ const Aigle = require('aigle');
 const redis = require('redis');
 Aigle.promisifyAll(redis);
 
-
 const POLL_SCRIPT = `
-local task = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 1)[1]
-if (task) then
-  redis.call('ZREM', KEYS[1], task)
+local queueKey = KEYS[1]
+local baseTime = ARGV[1]
+
+local taskKey = redis.call('ZRANGEBYSCORE', queueKey, '-inf', baseTime, 'LIMIT', 0, 1)[1]
+if (taskKey == nil) then
+  return taskKey
 end
-return task
+
+local taskDetail = redis.call('GET', taskKey)
+
+redis.call('DEL', taskKey)
+redis.call('ZREM', queueKey, taskKey)
+return taskDetail
+`;
+
+const PUSH_SCRIPT = `
+local queueKey = KEYS[1]
+local taskTime = ARGV[1]
+local taskKey = KEYS[2]
+local taskData = ARGV[2]
+
+redis.call('ZADD', queueKey, taskTime, taskKey)
+redis.call('SET', taskKey, taskData)
 `;
 
 // emit error?
@@ -29,7 +46,12 @@ class Queque {
 
         this.timer = null;
         this.pollScriptSha = null;
+        this.pushScriptSha = null;
         this.redis = redis.createClient(config.redis);
+    }
+
+    async runEval(sha, keys, args) {
+        return await this.redis.evalshaAsync(sha, keys.length, ...keys, ...args);
     }
 
     getMainTaskQueueKeyname() {
@@ -42,19 +64,29 @@ class Queque {
 
     async initialize() {
         console.log('loading script');
-        const resp = await this.redis.scriptAsync('load', POLL_SCRIPT);
-        console.log(resp);
-        this.pollScriptSha = resp;
+        const pollSha = await this.redis.scriptAsync('load', POLL_SCRIPT);
+        this.pollScriptSha = pollSha;
+        console.log(pollSha);
+        const pushSha = await this.redis.scriptAsync('load', PUSH_SCRIPT);
+        this.pushScriptSha = pushSha;
+        console.log(pushSha);
     }
 
+//    async push(jobKey, runAt, data) {
+//        const now = Date.now();
+//        const expiry = runAt - now + 60 * 60 * 1000;
+//        console.log(jobKey);
+//        await this.redis.multi()
+//            .zadd(this.getMainTaskQueueKeyname(), runAt, jobKey)
+//            .set(this.getTaskDetailKeyName(jobKey), JSON.stringify(data), 'PX', expiry)
+//            .execAsync();
+//    }
     async push(jobKey, runAt, data) {
-        const now = Date.now();
-        const expiry = runAt - now + 60 * 60 * 1000;
-        console.log(jobKey);
-        await this.redis.multi()
-            .zadd(this.getMainTaskQueueKeyname(), runAt, jobKey)
-            .set(this.getTaskDetailKeyName(jobKey), JSON.stringify(data), 'PX', expiry)
-            .execAsync();
+        const dataStr = JSON.stringify(data);
+        await this.runEval(this.pushScriptSha,
+            [this.getMainTaskQueueKeyname(), this.getTaskDetailKeyName(jobKey)],
+            [runAt, dataStr]
+        );
     }
 
     start() {
@@ -72,28 +104,25 @@ class Queque {
 
     async poll() {
         const checkTime = Date.now();
-        for(let i = 0; i < 100; i++) {
-            const taskKey = await this.redis.evalshaAsync(this.pollScriptSha, 1, this.getMainTaskQueueKeyname(), checkTime);
+        for(let i = 0; i < 50; i++) {
+            const task = await this.redis.evalshaAsync(this.pollScriptSha, 1, this.getMainTaskQueueKeyname(), checkTime);
 
-            if (!taskKey) {
+            if (!task) {
                 // no more task for now
                 return;
             }
 
-            console.log(taskKey);
-            this.handle(taskKey);
+            console.log(task);
+            this.handleAsync(task);
         }
     }
 
-    handle(taskKey) {
-        this.redis.getAsync(this.getTaskDetailKeyName(taskKey))
-        .then(info => {
-            console.log(info);
-            return this.handler(info);
-        })
-        .catch(e => {
-            console.log(e);
-        });
+    async handleAsync(task) {
+        try {
+            await this.handler(task);
+        }
+        catch(e) {
+        }
     }
 }
 
@@ -128,6 +157,7 @@ async function main() {
 
 async function push() {
     const qq = getQ();
+    await qq.initialize();
     await qq.push(
         'testkey',
         Date.now() + 5 * 1000,
